@@ -665,6 +665,104 @@ def test_atomic_operations(test, device):
         wp.config.verify_autograd_array_access = saved_verify_autograd_array_access_setting
 
 
+TILE_SIZE = 4
+
+
+@wp.kernel
+def tile_copy_kernel(x: wp.array[float], y: wp.array[float]):
+    t = wp.tile_load(x, shape=TILE_SIZE)
+    wp.tile_store(y, t)
+
+
+@wp.kernel
+def tile_copy_indexed_kernel(x: wp.array[float], y: wp.array[float]):
+    indices = wp.tile_arange(TILE_SIZE, dtype=int)
+    t = wp.tile_load_indexed(x, indices, shape=(TILE_SIZE,))
+    wp.tile_store_indexed(y, indices, t)
+
+
+@wp.kernel
+def tile_accumulate_kernel(x: wp.array[float], y: wp.array[float]):
+    t = wp.tile_load(x, shape=TILE_SIZE)
+    wp.tile_atomic_add(y, t)
+
+
+@wp.kernel
+def tile_accumulate_indexed_kernel(x: wp.array[float], y: wp.array[float]):
+    indices = wp.tile_arange(TILE_SIZE, dtype=int)
+    t = wp.tile_load(x, shape=TILE_SIZE)
+    wp.tile_atomic_add_indexed(y, indices, t)
+
+
+# tile loads should mark arrays as READ, and tile stores as WRITE
+def test_tile_array_access(test, device):
+    saved_verify_autograd_array_access_setting = wp.config.verify_autograd_array_access
+    try:
+        wp.config.verify_autograd_array_access = True
+
+        expected = "is being written to but has already been read from in a previous launch. This may corrupt gradient computation in the backward pass."
+
+        for kernel in (tile_copy_kernel, tile_copy_indexed_kernel):
+            # (kernel READ) -> (kernel WRITE) failure case, with the read and the write done by tile operations
+            a = wp.array(np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+            b = wp.zeros_like(a)
+            c = wp.array(-np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+
+            tape = wp.Tape()
+
+            with contextlib.redirect_stderr(io.StringIO()) as f:
+                with tape:
+                    wp.launch_tiled(kernel, dim=[1], inputs=[a, b], block_dim=TILE_SIZE, device=device)
+                    wp.launch_tiled(kernel, dim=[1], inputs=[c, a], block_dim=TILE_SIZE, device=device)
+
+            test.assertIn(expected, f.getvalue(), msg=f"{kernel.key}: tile read, tile write")
+
+            # (kernel READ) -> (kernel tile WRITE) failure case
+            a = wp.array(np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+            b = wp.zeros_like(a)
+            c = wp.array(-np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+
+            tape = wp.Tape()
+
+            with contextlib.redirect_stderr(io.StringIO()) as f:
+                with tape:
+                    wp.launch(square_kernel, a.shape, inputs=[a], outputs=[b], device=device)
+                    wp.launch_tiled(kernel, dim=[1], inputs=[c, a], block_dim=TILE_SIZE, device=device)
+
+            test.assertIn(expected, f.getvalue(), msg=f"{kernel.key}: read, tile write")
+
+            # (kernel tile READ) -> (kernel WRITE) failure case
+            a = wp.array(np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+            b = wp.zeros_like(a)
+            c = wp.array(-np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+
+            tape = wp.Tape()
+
+            with contextlib.redirect_stderr(io.StringIO()) as f:
+                with tape:
+                    wp.launch_tiled(kernel, dim=[1], inputs=[a, b], block_dim=TILE_SIZE, device=device)
+                    wp.launch(overwrite_kernel_a, c.shape, inputs=[c], outputs=[a], device=device)
+
+            test.assertIn(expected, f.getvalue(), msg=f"{kernel.key}: tile read, write")
+
+        # atomic tile additions are writes, like wp.atomic_add()
+        for kernel in (tile_accumulate_kernel, tile_accumulate_indexed_kernel):
+            a = wp.array(np.arange(TILE_SIZE), dtype=float, requires_grad=True, device=device)
+            b = wp.zeros_like(a)
+
+            tape = wp.Tape()
+
+            with contextlib.redirect_stderr(io.StringIO()) as f:
+                with tape:
+                    wp.launch(square_kernel, a.shape, inputs=[a], outputs=[b], device=device)
+                    wp.launch_tiled(kernel, dim=[1], inputs=[b, a], block_dim=TILE_SIZE, device=device)
+
+            test.assertIn(expected, f.getvalue(), msg=kernel.key)
+
+    finally:
+        wp.config.verify_autograd_array_access = saved_verify_autograd_array_access_setting
+
+
 class TestOverwrite(unittest.TestCase):
     pass
 
@@ -713,6 +811,7 @@ add_function_test(
     TestOverwrite, "test_deferred_backward_still_warns", test_deferred_backward_still_warns, devices=devices
 )
 add_function_test(TestOverwrite, "test_atomic_operations", test_atomic_operations, devices=devices)
+add_function_test(TestOverwrite, "test_tile_array_access", test_tile_array_access, devices=devices)
 
 # Some warning are only issued during codegen, and codegen only runs on cuda_0 in the MGPU case.
 cuda_device = get_cuda_test_devices(mode="basic")

@@ -4854,11 +4854,26 @@ def tile_load_tuple_value_func(arg_types: Mapping[str, type], arg_values: Mappin
     return tile(dtype=a.dtype, shape=shape, storage=arg_values["storage"])
 
 
+def _mark_tile_array_access(arr: Var, read: builtins.bool = False, write: builtins.bool = False):
+    """Record that a tile operation reads from or writes to a global memory array.
+
+    This is a codegen callback for ``wp.config.verify_autograd_array_access``, which
+    flags the kernel arguments that are read from or written to.
+    """
+    if warp._src.codegen.options.get("verify_autograd_array_access", False):
+        if read:
+            arr.mark_read()
+        if write:
+            arr.mark_write()
+
+
 def tile_load_tuple_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
     a = args["a"]
     shape = extract_tuple(args["shape"], as_constant=True)
     bounds_check = args["bounds_check"]
     aligned = args["aligned"]
+
+    _mark_tile_array_access(a, read=True)
 
     if None in shape:
         raise ValueError("Tile functions require shape to be a compile time constant.")
@@ -5030,6 +5045,8 @@ def tile_load_indexed_tuple_dispatch_func(input_types: Mapping[str, type], retur
     indices_tile = args["indices"]
     axis = args["axis"]
 
+    _mark_tile_array_access(a, read=True)
+
     shape = extract_tuple(args["shape"], as_constant=True)
 
     if None in shape:
@@ -5170,6 +5187,8 @@ def tile_store_dispatch_func(input_types: Mapping[str, type], return_type: Any, 
     t = args["t"]
     bounds_check = args["bounds_check"]
     aligned = args["aligned"]
+
+    _mark_tile_array_access(a, write=True)
 
     if "offset" in args:
         offset = extract_tuple(args["offset"])
@@ -5333,6 +5352,8 @@ def tile_store_indexed_dispatch_func(input_types: Mapping[str, type], return_typ
     axis = args["axis"]
     t = args["t"]
 
+    _mark_tile_array_access(a, write=True)
+
     if "offset" in args:
         offset = extract_tuple(args["offset"])
     else:
@@ -5476,6 +5497,8 @@ def tile_atomic_add_dispatch_func(input_types: Mapping[str, type], return_type: 
     a = args["a"]
     t = args["t"]
     bounds_check = args["bounds_check"]
+
+    _mark_tile_array_access(a, write=True)
 
     if "offset" in args:
         offset = extract_tuple(args["offset"])
@@ -5649,6 +5672,8 @@ def tile_atomic_add_indexed_dispatch_func(input_types: Mapping[str, type], retur
     indices_tile = args["indices"]
     axis = args["axis"]
     t = args["t"]
+
+    _mark_tile_array_access(a, write=True)
 
     if "offset" in args:
         offset = extract_tuple(args["offset"])
